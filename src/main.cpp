@@ -11,8 +11,10 @@ constexpr uint32_t SETTLE_US = 5000;
 constexpr uint32_t TIMEOUT_US = 200000;
 constexpr uint32_t PAUSE_MS = 500;
 
+enum class Result { Ok, Timeout, Skipped };
+
 struct Measurement {
-  bool ok;
+  Result result;
   uint32_t delayUs;
   uint32_t bounceUs;
   uint32_t edges;
@@ -24,7 +26,7 @@ struct Stats {
   int count = 0;
 
   void add(const Measurement &m) {
-    if (!m.ok) return;
+    if (m.result != Result::Ok) return;
     delaySum += m.delayUs;
     bounceSum += m.bounceUs;
     count++;
@@ -66,16 +68,34 @@ Measurement switchRelay(uint8_t level, uint8_t expectedContact) {
     if (edges == 0 || micros() - last < SETTLE_US) continue;
 
     if (digitalRead(CONTACT_PIN) == expectedContact) {
-      return {true, first - start, last - first, edges};
+      return {Result::Ok, first - start, last - first, edges};
     }
     resetEdges();
   }
-  return {false, 0, 0, 0};
+  return {Result::Timeout, 0, 0, 0};
+}
+
+bool isContactOpen() {
+  return digitalRead(CONTACT_PIN) == HIGH;
+}
+
+// After a timeout the contact state is unknown: put the relay back to OFF and check it really opened.
+bool returnToIdle() {
+  Serial.printf("  after timeout: contact %s, relay -> OFF\n", isContactOpen() ? "open" : "CLOSED");
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+  delay(PAUSE_MS);
+  const bool open = isContactOpen();
+  Serial.printf("  idle check: contact %s\n", open ? "open, continuing" : "still CLOSED");
+  return open;
 }
 
 void printMeasurement(const char *label, const Measurement &m) {
-  if (!m.ok) {
+  if (m.result == Result::Timeout) {
     Serial.printf("  %s: TIMEOUT\n", label);
+    return;
+  }
+  if (m.result == Result::Skipped) {
+    Serial.printf("  %s: skipped, ON did not complete\n", label);
     return;
   }
   Serial.printf("  %s: %6lu us  (bounce %5lu us, %lu edges)\n", label,
@@ -103,13 +123,13 @@ void setup() {
 
   Serial.println("\n=== Relay switching time ===");
 
-  if (digitalRead(CONTACT_PIN) != HIGH) {
+  if (!isContactOpen()) {
     Serial.println("Contact is closed with the relay off. Probing:");
     for (uint8_t level : {HIGH, LOW, HIGH}) {
       digitalWrite(RELAY_PIN, level);
       delay(PAUSE_MS);
       Serial.printf("  IN=%s -> contact %s\n", level == HIGH ? "HIGH" : "LOW ",
-                    digitalRead(CONTACT_PIN) == LOW ? "CLOSED" : "open");
+                    isContactOpen() ? "open" : "CLOSED");
     }
     digitalWrite(RELAY_PIN, RELAY_OFF);
     return;
@@ -120,16 +140,27 @@ void setup() {
   Stats onStats, offStats;
   for (int i = 1; i <= MEASUREMENTS; i++) {
     Measurement on = switchRelay(RELAY_ON, LOW);
-    delay(PAUSE_MS);
-    Measurement off = switchRelay(RELAY_OFF, HIGH);
-    delay(PAUSE_MS);
-
-    onStats.add(on);
-    offStats.add(off);
+    Measurement off = {Result::Skipped, 0, 0, 0};
+    if (on.result == Result::Ok) {
+      delay(PAUSE_MS);
+      off = switchRelay(RELAY_OFF, HIGH);
+    }
 
     Serial.printf("#%d\n", i);
     printMeasurement("ON ", on);
     printMeasurement("OFF", off);
+
+    onStats.add(on);
+    offStats.add(off);
+
+    if (on.result != Result::Ok || off.result != Result::Ok) {
+      if (!returnToIdle()) {
+        Serial.println("Contact did not open with the relay OFF, stopping the series.");
+        break;
+      }
+    } else {
+      delay(PAUSE_MS);
+    }
   }
 
   detachInterrupt(digitalPinToInterrupt(CONTACT_PIN));
